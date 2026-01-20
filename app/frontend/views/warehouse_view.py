@@ -139,9 +139,10 @@ def render_loans_section(db):
                         crud.process_rental_action(db, op["id"], "WYDANE")
                         st.success(f"Wydano wypożyczenie #{op['id']}")
                         st.rerun()
-                else:
+
+                elif op["typ"] == "ZWROT":  # Zmiana z 'else' na 'elif' sprawdzający typ operacji
                     if st.button("Zarejestruj zwrot", key=f"in_{op['id']}", use_container_width=True):
-                        crud.process_rental_action(db, op["id"], "ZWRÓCONE")
+                        crud.process_rental_action(db, op["id"], "ZAKOŃCZONA")
                         st.success(f"Odebrano zwrot #{op['id']}")
                         st.rerun()
 
@@ -154,17 +155,21 @@ def render_browse_tools_section(db):
 
     # 2. FILTRY I SEARCH
     with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
+        # Zmieniono układ na 5 kolumn, aby zmieścić nowy filtr
+        c1, c2, c3, c4, c5 = st.columns([1.5, 1, 1, 1, 1])
         search_q = c1.text_input("🔍 Szukaj (Model lub SN)", placeholder="Wpisz nazwę...")
 
         # Dynamiczne listy do filtrów
         categories = ["Wszystkie"] + sorted(list(set(i.model.kategoria for i in items if i.model.kategoria)))
         producers = ["Wszyscy"] + sorted(list(set(i.model.producent for i in items if i.model.producent)))
         statuses = ["Wszystkie", "W_MAGAZYNIE", "U_KLIENTA", "W_WARSZTACIE"]
+        # Lista dostępnych stanów technicznych
+        technical_states = ["Wszystkie", "SPRAWNY", "AWARIA", "WYMAGA_PRZEGLADU"]
 
         f_cat = c2.selectbox("Kategoria", categories)
         f_prod = c3.selectbox("Producent", producers)
         f_stat = c4.selectbox("Lokalizacja", statuses)
+        f_stan = c5.selectbox("Stan techniczny", technical_states)
 
     # 3. LOGIKA FILTROWANIA
     filtered = items
@@ -177,6 +182,9 @@ def render_browse_tools_section(db):
         filtered = [i for i in filtered if i.model.producent == f_prod]
     if f_stat != "Wszystkie":
         filtered = [i for i in filtered if i.status == f_stat]
+    # NOWY FILTR: Filtrowanie po stanie technicznym
+    if f_stan != "Wszystkie":
+        filtered = [i for i in filtered if i.stan_techniczny == f_stan]
 
     # 4. TABELA
     if not filtered:
@@ -210,7 +218,7 @@ def render_browse_tools_section(db):
                 if i.stan_techniczny == "SPRAWNY":
                     options.append("Oznacz: Wymaga przeglądu")
                 elif i.stan_techniczny == "WYMAGA_PRZEGLADU":
-                    options.append("Cofnij: Oznacz jako sprawny")  # Poprawka pomyłki
+                    options.append("Cofnij: Oznacz jako sprawny")
                     options.append("Przekaż: Do serwisu")
                 elif i.stan_techniczny == "AWARIA":
                     options.append("Przekaż: Do serwisu")

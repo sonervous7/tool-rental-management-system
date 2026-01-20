@@ -1,6 +1,6 @@
 import streamlit as st
 import datetime
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from app.backend import crud, models, schemas
 from pydantic import ValidationError
 
@@ -216,7 +216,7 @@ def render_models_section(db):
         f_cat = c2.selectbox("Kategoria", categories)
         f_prod = c3.selectbox("Producent", producers)
 
-        price_range = st.slider("Zakres ceny za dobę (zł)", 0, 1000, (0, 1000))
+        price_range = st.slider("Zakres ceny za dobę (zł)", 0, 10000, (0, 10000))
 
         if st.button("Resetuj filtry", use_container_width=True):
             st.rerun()
@@ -259,21 +259,45 @@ def render_models_section(db):
     if st.button("➕ Dodaj nowy model narzędzia", type="primary"):
         tool_model_dialog(db)
 
+
 def render_analytics_section(db):
-    st.header("📊 Analiza")
+    st.subheader("📊 Statystyki i Analiza")
 
-    col1, col2 = st.columns(2)
-    date_from = col1.date_input("Od")
-    date_to = col2.date_input("Do")
+    # 1. Zakres dat
+    today = date.today()
+    default_start = today - timedelta(days=7)  # Krótszy zakres domyślny, by widzieć testy
 
-    if st.button("Generuj"):
+    date_range = st.date_input("Zakres analizy", [default_start, today])
+
+    if len(date_range) == 2:
+        date_from, date_to = date_range
+
+        # 2. Pobranie danych
         summary = crud.analytics_summary(db, date_from, date_to)
-        daily = crud.analytics_daily(db, date_from, date_to)
+        daily_data = crud.analytics_daily(db, date_from, date_to)
 
-        st.metric("Liczba wypożyczeń", summary["total_rentals"])
-        st.metric("Przychód", f"{summary['total_revenue']} zł")
+        # 3. Wyświetlenie metryk (Summary)
+        c1, c2 = st.columns(2)
+        c1.metric("Liczba rezerwacji", summary["total_rentals"])
+        c2.metric("Wartość zamówień", f"{summary['total_revenue']:.2f} zł")
 
-        st.line_chart(daily, x="dzien", y="liczba_wypozyczen")
+        st.divider()
+
+        # 4. Wykres (Daily)
+        if daily_data:
+            import pandas as pd
+            df = pd.DataFrame(daily_data, columns=["Data", "Suma"])
+
+            st.write("**Przychód dzień po dniu (wg daty rezerwacji):**")
+            st.line_chart(df.set_index("Data"), use_container_width=True)
+
+            # Tabela pomocnicza dla Kierownika
+            with st.expander("👁️ Pokaż dane tabelaryczne"):
+                st.dataframe(df, use_container_width=True)
+        else:
+            st.info("Brak rezerwacji w wybranym terminie. Spróbuj zmienić datę w kalendarzu na dzisiejszą.")
+    else:
+        st.warning("Proszę wybrać zakres (datę początkową i końcową).")
 
 def render_export_section(db):
     st.header("⬇️ Eksport CSV")

@@ -325,3 +325,20 @@ class ExportRequest(BaseModel):
 
     # Generic filters (e.g., {"status": "WYDANE", "klient_id": 5})
     filtry: Optional[Dict[str, Any]] = None
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_rules(cls, v):
+        return validate_password_strength(v) # Twoja funkcja z regułami
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, v, info):
+        if "new_password" in info.data and v != info.data["new_password"]:
+            raise ValueError("Nowe hasła nie są identyczne")
+        return v

@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, date, time
 
 from sqlalchemy import func, cast, Date, and_, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 
 from passlib.context import CryptContext
@@ -31,9 +31,35 @@ def hash_password(password: str) -> str:
     return hashed.decode("utf-8")
 
 
-def verify_password(password: str, hashed: str) -> bool:
-    sha = hashlib.sha256(password.encode("utf-8")).digest()
-    return bcrypt.checkpw(sha, hashed.encode("utf-8"))
+def verify_password(plain_password: str, hashed_in_db: str) -> bool:
+    """
+    Weryfikacja wielopoziomowa:
+    1. Próba: SHA256 + BCrypt (Twoja metoda)
+    2. Próba: Standardowy BCrypt (bez SHA256)
+    3. Próba: Plain Text (dla testowych kont)
+    """
+    if not hashed_in_db:
+        return False
+
+    # Jeśli wygląda na hash BCrypt (zaczyna się od $2)
+    if hashed_in_db.startswith('$2'):
+        try:
+            # PRÓBA 1: Twoja metoda (SHA256 digest + BCrypt)
+            sha = hashlib.sha256(plain_password.encode("utf-8")).digest()
+            if bcrypt.checkpw(sha, hashed_in_db.encode("utf-8")):
+                return True
+
+            # PRÓBA 2: Standardowy BCrypt (sam tekst + BCrypt)
+            # To na wypadek, gdyby Jan Kowalski był stworzony inaczej
+            if bcrypt.checkpw(plain_password.encode("utf-8"), hashed_in_db.encode("utf-8")):
+                return True
+
+        except Exception as e:
+            print(f"Błąd weryfikacji hasha: {e}")
+            return False
+
+    # PRÓBA 3: Czysty tekst (fallback)
+    return plain_password == hashed_in_db
 
 
 # =========================================================
@@ -399,70 +425,46 @@ def get_tool_model(db: Session, model_id: int) -> dict | None:
 # Kierownik – analytics
 # =========================================================
 
-def analytics_summary(
-    db: Session,
-    date_from: Date,
-    date_to: Date,
-) -> dict:
-    """
-    Zwraca podsumowanie w okresie [date_from, date_to] po dacie rezerwacji.
-    """
+def analytics_summary(db: Session, date_from, date_to) -> dict:
+    """Podsumowanie ogólne przychodów i rezerwacji."""
+    # Konwersja dat na zakres czasowy (od 00:00 do 23:59)
     start_dt = datetime.combine(date_from, datetime.min.time())
     end_dt = datetime.combine(date_to, datetime.max.time())
 
+    # Liczba rezerwacji
     total_rentals = (
         db.query(func.count(models.Wypozyczenie.id))
         .filter(models.Wypozyczenie.data_rezerwacji.between(start_dt, end_dt))
-        .scalar()
-        or 0
+        .scalar() or 0
     )
 
+    # Całkowity przychód (COALESCE chroni przed None)
     total_revenue = (
         db.query(func.coalesce(func.sum(models.Wypozyczenie.koszt_calkowity), 0))
         .filter(models.Wypozyczenie.data_rezerwacji.between(start_dt, end_dt))
-        .scalar()
-        or 0
+        .scalar() or 0
     )
 
     return {
-        "date_from": date_from,
-        "date_to": date_to,
         "total_rentals": int(total_rentals),
         "total_revenue": float(total_revenue),
     }
 
-
-def analytics_daily(
-    db: Session,
-    date_from: Date,
-    date_to: Date,
-) -> list[dict]:
-    """
-    Dzienna liczba wypożyczeń + dzienny przychód.
-    """
+def analytics_daily(db: Session, date_from, date_to):
+    """Dzienny przychód dla wykresu."""
     start_dt = datetime.combine(date_from, datetime.min.time())
     end_dt = datetime.combine(date_to, datetime.max.time())
 
-    rows = (
+    return (
         db.query(
-            cast(models.Wypozyczenie.data_rezerwacji, Date).label("dzien"),
-            func.count(models.Wypozyczenie.id).label("liczba_wypozyczen"),
-            func.coalesce(func.sum(models.Wypozyczenie.koszt_calkowity), 0).label("przychod"),
+            func.date(models.Wypozyczenie.data_rezerwacji).label("dzien"),
+            func.coalesce(func.sum(models.Wypozyczenie.koszt_calkowity), 0).label("suma")
         )
         .filter(models.Wypozyczenie.data_rezerwacji.between(start_dt, end_dt))
-        .group_by("dzien")
+        .group_by(func.date(models.Wypozyczenie.data_rezerwacji))
         .order_by("dzien")
         .all()
     )
-
-    return [
-        {
-            "dzien": r.dzien,
-            "liczba_wypozyczen": int(r.liczba_wypozyczen),
-            "przychod": float(r.przychod),
-        }
-        for r in rows
-    ]
 
 
 def analytics_top_models(
@@ -577,50 +579,101 @@ def export_table_to_csv(
     return buf.getvalue()
 
 
-def authenticate_user(db: Session, login: str, password: str):
-    """Weryfikuje login/hasło i zwraca obiekt pracownika oraz jego rolę."""
-    user = db.query(models.Pracownik).filter(models.Pracownik.login == login).first()
+def authenticate_user(db: Session, identifier: str, password: str):
+    """Logowanie uniwersalne z pełnym debugowaniem w konsoli."""
 
-    if user and verify_password(password, user.haslo):
-        # Sprawdzamy rolę po tabelach podtypów
-        if user.kierownik: return user, "KIEROWNIK"
-        if user.magazynier: return user, "MAGAZYNIER"
-        if user.serwisant: return user, "SERWISANT"
+    print("\n" + "=" * 50)
+    print(f"[DEBUG] PROCES LOGOWANIA")
+    print(f"[DEBUG] Wpisany identyfikator: {repr(identifier)}")
+    print(f"[DEBUG] Długość wpisanego hasła: {len(password)} znaków")
+    print("=" * 50)
 
+    # 1. Szukamy w pracownikach
+    emp = db.query(models.Pracownik).filter(
+        or_(models.Pracownik.login == identifier, models.Pracownik.email == identifier)
+    ).first()
+
+    if emp:
+        print(f"[DEBUG] [PRACOWNIK] Znaleziono rekord: {repr(emp.login)} (ID: {emp.id})")
+        print(f"[DEBUG] [PRACOWNIK] Hash w bazie: {repr(emp.haslo)}")
+
+        # Weryfikacja hasła
+        check = verify_password(password, emp.haslo)
+        print(f"[DEBUG] [PRACOWNIK] Wynik weryfikacji hasła: {check}")
+
+        if check:
+            # Sprawdzanie roli
+            role = "PRACOWNIK"
+            if emp.kierownik:
+                role = "KIEROWNIK"
+            elif emp.magazynier:
+                role = "MAGAZYNIER"
+            elif emp.serwisant:
+                role = "SERWISANT"
+
+            print(f"[DEBUG] [SUCCESS] Zalogowano jako: {role}")
+            print("=" * 50 + "\n")
+            return emp, role
+        else:
+            print(f"[DEBUG] [FAIL] Hasło pracownika nie pasuje.")
+    else:
+        print("[DEBUG] [PRACOWNIK] Nie znaleziono pracownika o tym loginie/emailu.")
+
+    # 2. Szukamy w klientach
+    print("-" * 30)
+    cust = db.query(models.Klient).filter(models.Klient.email == identifier).first()
+    if cust:
+        print(f"[DEBUG] [KLIENT] Znaleziono rekord: {repr(cust.email)} (ID: {cust.id})")
+        print(f"[DEBUG] [KLIENT] Hash w bazie: {repr(cust.haslo)}")
+
+        check = verify_password(password, cust.haslo)
+        print(f"[DEBUG] [KLIENT] Wynik weryfikacji hasła: {check}")
+
+        if check:
+            print("[DEBUG] [SUCCESS] Zalogowano jako: KLIENT")
+            print("=" * 50 + "\n")
+            return cust, "KLIENT"
+        else:
+            print(f"[DEBUG] [FAIL] Hasło klienta nie pasuje.")
+    else:
+        print("[DEBUG] [KLIENT] Nie znaleziono klienta o tym emailu.")
+
+    print("[DEBUG] [FINAL] Logowanie odrzucone.")
+    print("=" * 50 + "\n")
     return None, None
 
 # SERWISANT
 
 def add_service_action(
-    db: Session,
-    egzemplarz_id: int,
-    serwisant_id: int,
-    rodzaj: str,  # "NAPRAWA", "PRZEGLAD" lub "NOTATKA"
-    notatka: str,
-    nowy_stan: str = None  # Opcjonalna zmiana stanu technicznego
+        db: Session,
+        egzemplarz_id: int,
+        serwisant_id: int,
+        rodzaj: str,
+        notatka: str,
+        nowy_stan: str = None
 ):
-    """Realizuje PU 21, 22 i 23 - zapisuje czynność i opcjonalnie aktualizuje stan narzędzia."""
+    """Rejestruje czynność i zeruje licznik przy zmianie na SPRAWNY."""
     egzemplarz = db.get(models.EgzemplarzNarzedzia, egzemplarz_id)
     if not egzemplarz:
         raise ValueError("Nie znaleziono takiego egzemplarza.")
 
-    # 1. Tworzymy wpis w historii (zgodnie z Twoją relacją Serwisant -> Czynność)
+    # 1. Tworzymy wpis w historii czynności
     nowa_czynnosc = models.CzynnoscSerwisowa(
         egzemplarz_id=egzemplarz_id,
         serwisant_id=serwisant_id,
         rodzaj=rodzaj,
         notatka_opis=notatka,
-        data_rozpoczecia=datetime.datetime.utcnow(),
-        data_zakonczenia=datetime.datetime.utcnow()
+        data_rozpoczecia=datetime.utcnow(),
+        data_zakonczenia=datetime.utcnow()
     )
     db.add(nowa_czynnosc)
 
-    # 2. Jeśli to naprawa lub przegląd, zazwyczaj przywracamy sprzęt do sprawności
+    # 2. Aktualizacja stanu i ewentualny reset licznika
     if nowy_stan:
         egzemplarz.stan_techniczny = nowy_stan
-        # Jeśli sprzęt naprawiony, wraca wirtualnie do magazynu
+
         if nowy_stan == "SPRAWNY":
-            egzemplarz.status = "W_MAGAZYNIE"
+            egzemplarz.licznik_wypozyczen = 0  # Reset przebiegu
 
     try:
         db.commit()
@@ -664,23 +717,48 @@ def list_pending_operations(db: Session):
     return results
 
 
-def process_rental_action(db: Session, rental_id: int, new_status: str):
-    """Aktualizuje status wypożyczenia (PU 24, 25)."""
-    rental = db.get(models.Wypozyczenie, rental_id)
-    if not rental:
-        raise ValueError("Nie znaleziono wypożyczenia.")
+# app/backend/crud.py
 
-    rental.status = new_status
+def process_rental_action(db: Session, wypozyczenie_id: int, nowy_status_db: str):
+    """
+    Zarządza statusem rezerwacji (REZERWACJA -> WYDANE -> ZAKOŃCZONA).
+    Przy okazji aktualizuje stan techniczny i lokalizację narzędzi.
+    """
+    wyp_obj = db.query(models.Wypozyczenie).filter(models.Wypozyczenie.id == wypozyczenie_id).first()
+    if not wyp_obj:
+        return
 
-    # Dodatkowa logika: Jeśli wydajemy, zmieniamy status egzemplarzy na U_KLIENTA
-    # Jeśli odbieramy zwrot, zmieniamy status egzemplarzy na W_MAGAZYNIE
-    new_item_status = "U_KLIENTA" if new_status == "WYDANE" else "W_MAGAZYNIE"
+    # Ustawiamy status wypożyczenia (ten, który widzi klient w historii)
+    wyp_obj.status = nowy_status_db
 
-    for poz in rental.pozycje:
-        poz.egzemplarz.status = new_item_status
+    if nowy_status_db == "WYDANE":
+        for p in wyp_obj.pozycje:
+            # Lokalizacja narzędzia zmienia się na "U_KLIENTA"
+            p.egzemplarz.status = "U_KLIENTA"
 
-    db.commit()
-    return rental
+    elif nowy_status_db == "ZAKOŃCZONA":  # Zmienione z ZWRÓCONE na ZAKOŃCZONA
+        for p in wyp_obj.pozycje:
+            egz = p.egzemplarz
+
+            # 1. Narzędzie wraca fizycznie do magazynu
+            egz.status = "W_MAGAZYNIE"
+
+            # 2. Zwiększamy licznik (przebieg)
+            egz.licznik_wypozyczen += 1
+
+            # 3. Ustalamy stan techniczny (Hierarchia)
+            if p.czy_zgloszono_usterke:
+                egz.stan_techniczny = "AWARIA"
+            elif egz.licznik_wypozyczen >= 5:
+                egz.stan_techniczny = "WYMAGA_PRZEGLADU"
+            else:
+                egz.stan_techniczny = "SPRAWNY"
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
 
 def update_item_status(db: Session, item_id: int, new_status: str):
     """Aktualizuje status lokalizacji egzemplarza (np. przekazanie do warsztatu)."""
@@ -737,27 +815,45 @@ def bulk_create_items(db: Session, model_id: int, count: int):
         raise ValueError(f"Błąd bazy danych: {str(e)}")
 
 def mark_for_inspection(db: Session, item_id: int):
-    """Zmienia stan techniczny na WYMAGA_PRZEGLADU (PU 27/Operacyjne)."""
+    """Zmienia stan na WYMAGA_PRZEGLADU i PRZENOSI do warsztatu."""
     item = db.get(models.EgzemplarzNarzedzia, item_id)
-    if item and item.status == "W_MAGAZYNIE" and item.stan_techniczny == "SPRAWNY":
+    # Usuwamy warunek status == "W_MAGAZYNIE" jeśli chcemy pozwolić na oznaczenie
+    # narzędzia, które np. właśnie wróciło od klienta
+    if item:
         item.stan_techniczny = "WYMAGA_PRZEGLADU"
+        item.status = "W_WARSZTACIE"  # <--- KLUCZOWA ZMIANA: Przenosimy do warsztatu
         db.commit()
     return item
 
+
 def receive_from_service(db: Session, item_id: int):
-    """Przyjmuje narzędzie z powrotem do magazynu (zmiana statusu z W_WARSZTACIE na W_MAGAZYNIE)."""
+    """
+    Używane przez Magazyniera: Fizyczny odbiór z warsztatu.
+    To jedyne miejsce, gdzie resetujemy licznik i przywracamy status W_MAGAZYNIE.
+    """
     item = db.get(models.EgzemplarzNarzedzia, item_id)
     if item and item.status == "W_WARSZTACIE":
         item.status = "W_MAGAZYNIE"
-        item.warsztat_id = None # Czyszczenie relacji z warsztatem
+        item.warsztat_id = None
+
+        # Bezpiecznik: przy powrocie do magazynu sprzęt musi być czysty i sprawny
+        item.stan_techniczny = "SPRAWNY"
+        item.licznik_wypozyczen = 0  # <--- RESET LICZNIKA
+
         db.commit()
     return item
 
+
 def update_technical_state(db: Session, item_id: int, new_state: str):
-    """Zmienia stan techniczny egzemplarza (np. SPRAWNY <-> WYMAGA_PRZEGLADU)."""
+    """Zmienia stan techniczny egzemplarza i resetuje licznik jeśli sprawny."""
     item = db.get(models.EgzemplarzNarzedzia, item_id)
     if item:
         item.stan_techniczny = new_state
+
+        # LOGIKA RESETU: Jeśli przywracamy do sprawności, zerujemy licznik wypożyczeń
+        if new_state == "SPRAWNY":
+            item.licznik_wypozyczen = 0
+
         db.commit()
     return item
 
@@ -796,26 +892,43 @@ def get_available_items_for_term(db: Session, model_id: int, start_dt: datetime,
 
 # app/backend/crud.py
 
+# app/backend/crud.py
+
 def create_reservation(db: Session, client_id: int, model_id: int, qty: int, start_dt: datetime, end_dt: datetime):
+    # 1. Sprawdzamy dostępność
     available = get_available_items_for_term(db, model_id, start_dt, end_dt)
 
     if len(available) < qty:
         raise ValueError(f"Brak wolnych sztuk.")
 
-    # Tworzymy nagłówek zgodnie z Twoim modelem
+    # 2. Pobieramy model, aby wyciągnąć cenę za dobę
+    tool_model = db.query(models.ModelNarzedzia).filter(models.ModelNarzedzia.id == model_id).first()
+    if not tool_model:
+        raise ValueError("Nie znaleziono modelu narzędzia.")
+
+    # 3. Obliczamy czas trwania (liczba dni)
+    # Jeśli start i end to ten sam dzień, liczymy jako 1 dobę
+    delta = end_dt.date() - start_dt.date()
+    days = max(delta.days, 1)
+
+    # 4. Wyliczamy koszt całkowity
+    total_cost = days * tool_model.cena_za_dobe * qty
+
+    # 5. Tworzymy nagłówek z poprawnym kosztem
     new_rental = models.Wypozyczenie(
-        klient_id=client_id,  # Musi istnieć w tabeli klienci!
+        klient_id=client_id,
         status="REZERWACJA",
-        data_plan_wydania=start_dt,  # Twoje pole
-        data_plan_zwrotu=end_dt,  # Twoje pole
-        magazynier_wydaj_id=None,  # Jeszcze nie wydane
-        magazynier_przyjmij_id=None,  # Jeszcze nie zwrócone
-        koszt_calkowity=0.0  # Możesz tu wyliczyć cenę
+        data_plan_wydania=start_dt,
+        data_plan_zwrotu=end_dt,
+        magazynier_wydaj_id=None,
+        magazynier_przyjmij_id=None,
+        koszt_calkowity=total_cost  # <--- TUTAJ WPISUJEMY WYLICZONĄ KWOTĘ
     )
 
     db.add(new_rental)
-    db.flush()
+    db.flush() # Pobieramy ID dla pozycji
 
+    # 6. Dodajemy pozycje (egzemplarze)
     for i in range(qty):
         pos = models.PozycjaWypozyczenia(
             wypozyczenie_id=new_rental.id,
@@ -828,18 +941,17 @@ def create_reservation(db: Session, client_id: int, model_id: int, qty: int, sta
 
 
 def create_customer(db: Session, payload: schemas.CustomerCreate):
-    # Sprawdzenie czy email już istnieje
     existing = db.query(models.Klient).filter(models.Klient.email == payload.email).first()
     if existing:
         raise ValueError("Użytkownik o tym adresie email już istnieje.")
 
-    # Tworzymy obiekt używając nazw kolumn widocznych w Twoim błędzie SQL
+    # TWORZYMY KLIENTA Z HASZOWANYM HASŁEM
     db_customer = models.Klient(
         imie=payload.imie,
         nazwisko=payload.nazwisko,
         email=payload.email,
         telefon=payload.telefon,
-        haslo=payload.haslo,
+        haslo=hash_password(payload.haslo), # <--- UŻYWAMY HASHOWANIA
         pytanie_pomocnicze=payload.pytanie_pomocnicze,
         odp_na_pytanie_pom=payload.odpowiedz_pomocnicza
     )
@@ -851,32 +963,9 @@ def create_customer(db: Session, payload: schemas.CustomerCreate):
         return db_customer
     except Exception as e:
         db.rollback()
-        # Wyświetlamy dokładniejszy błąd, żeby wiedzieć co dokładnie nie pasuje
         raise e
 
 
-def authenticate_user(db: Session, identifier: str, password: str):
-    # 1. Szukamy w pracownikach
-    emp = db.query(models.Pracownik).filter(
-        or_(models.Pracownik.login == identifier, models.Pracownik.email == identifier)
-    ).first()
-
-    if emp and emp.haslo == password:
-        # Sprawdzamy podtypy (relacje uselist=False zwrócą obiekt lub None)
-        if emp.kierownik:
-            return emp, "KIEROWNIK"
-        if emp.magazynier:
-            return emp, "MAGAZYNIER"
-        if emp.serwisant:
-            return emp, "SERWISANT"
-        return emp, "PRACOWNIK"
-
-    # 2. Szukamy w klientach
-    cust = db.query(models.Klient).filter(models.Klient.email == identifier).first()
-    if cust and cust.haslo == password:
-        return cust, "KLIENT"
-
-    return None, None
 
 def get_security_question_by_email(db: Session, email: str):
     """Szuka klienta po emailu i zwraca jego pytanie pomocnicze."""
@@ -892,3 +981,130 @@ def verify_security_answer(db: Session, email: str, answer: str):
         models.Klient.odp_na_pytanie_pom == answer
     ).first()
     return user is not None
+
+
+# app/backend/crud.py
+
+def update_user_password(db: Session, user_obj: any, role: str, payload: schemas.PasswordChange):
+    # 1. Łączymy obiekt z bieżącą sesją
+    db_user = db.merge(user_obj)
+
+    # 2. Weryfikacja starego hasła
+    if not verify_password(payload.current_password, db_user.haslo):
+        raise ValueError("Aktualne hasło jest niepoprawne")
+
+    # 3. Hashowanie i zapis nowego hasła
+    db_user.haslo = hash_password(payload.new_password)
+
+    try:
+        db.commit()
+        db.refresh(db_user)
+        # Zwracamy zaktualizowany obiekt, aby widok mógł go zapisać w sesji
+        return db_user
+    except Exception as e:
+        db.rollback()
+        raise e
+
+def get_customer_rentals(db: Session, klient_id: int):
+    """Pobiera historię wypożyczeń klienta wraz z pozycjami i modelami narzędzi."""
+    return db.query(models.Wypozyczenie)\
+        .options(
+            joinedload(models.Wypozyczenie.pozycje)
+            .joinedload(models.PozycjaWypozyczenia.egzemplarz)
+            .joinedload(models.EgzemplarzNarzedzia.model)
+        )\
+        .filter(models.Wypozyczenie.klient_id == klient_id)\
+        .order_by(models.Wypozyczenie.data_rezerwacji.desc())\
+        .all()
+
+def create_opinion(db: Session, klient_id: int, model_id: int, ocena: int, komentarz: str):
+    """Zapisuje nową opinię klienta o modelu narzędzia."""
+    new_opinion = models.Opinia(
+        klient_id=klient_id,
+        model_id=model_id,
+        ocena=ocena,
+        komentarz=komentarz,
+        data_wystawienia=datetime.now()
+    )
+    db.add(new_opinion)
+    db.commit()
+    db.refresh(new_opinion)
+    return new_opinion
+
+
+def get_active_rental_items(db: Session, klient_id: int):
+    """
+    Pobiera wszystkie aktywne pozycje wypożyczeń dla klienta.
+    Statusy: 'REZERWACJA' lub 'WYDANE' (czyli Twoje 'Aktywna').
+    """
+    return db.query(models.PozycjaWypozyczenia) \
+        .join(models.Wypozyczenie) \
+        .filter(
+        models.Wypozyczenie.klient_id == klient_id,
+        models.Wypozyczenie.status.in_(["REZERWACJA", "WYDANE"]),
+        models.PozycjaWypozyczenia.czy_zgloszono_usterke == False
+    ) \
+        .all()
+
+
+def report_tool_fault(db: Session, pozycja_id: int, opis: str):
+    """
+    Realizuje zgłoszenie usterki:
+    1. Aktualizuje pozycję wypożyczenia.
+    2. Zmienia status egzemplarza na AWARIA.
+    """
+    pozycja = db.query(models.PozycjaWypozyczenia).filter(models.PozycjaWypozyczenia.id == pozycja_id).first()
+    if not pozycja:
+        return False
+
+    # 1. Aktualizacja pozycji
+    pozycja.czy_zgloszono_usterke = True
+    pozycja.opis_usterki = opis
+
+    # 2. Zmiana statusu fizycznego egzemplarza
+    # Zakładam, że w modelu EgzemplarzNarzedzia pole nazywa się 'status'
+    pozycja.egzemplarz.status = "AWARIA"
+
+    # Opcjonalnie: można tu dodać logikę zmiany statusu całego wypożyczenia,
+    # ale zazwyczaj wypożyczenie trwa dalej dla pozostałych przedmiotów.
+
+    try:
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+
+    # app/backend/crud.py
+
+# app/backend/crud.py
+
+def get_issued_rental_items(db: Session, klient_id: int):
+    """
+    Pobiera tylko te pozycje wypożyczeń, które są fizycznie u klienta.
+    Filtrujemy po statusie wypożyczenia 'WYDANE'.
+    """
+    return db.query(models.PozycjaWypozyczenia)\
+        .join(models.Wypozyczenie)\
+        .filter(
+            models.Wypozyczenie.klient_id == klient_id,
+            models.Wypozyczenie.status == "WYDANE", # <--- Kluczowa zmiana
+            models.PozycjaWypozyczenia.czy_zgloszono_usterke == False
+        )\
+        .all()
+
+# app/backend/crud.py
+
+def check_if_opinion_exists(db: Session, client_id: int, model_id: int) -> bool:
+    """Sprawdza, czy ten klient już kiedykolwiek ocenił ten model narzędzia."""
+    from . import models
+    return db.query(models.Opinia).filter(
+        models.Opinia.klient_id == client_id,
+        models.Opinia.model_id == model_id
+    ).first() is not None
+
+# app/backend/crud.py
+
+def get_model_opinions(db: Session, model_id: int):
+    """Pobiera wszystkie opinie dla danego modelu wraz z danymi klientów."""
+    return db.query(models.Opinia).filter(models.Opinia.model_id == model_id).all()

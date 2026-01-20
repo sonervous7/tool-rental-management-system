@@ -10,46 +10,56 @@ from views.technician_view import show_technician_ui
 # from views.technician_view import show_technician_ui # to zrobimy za chwilę
 
 st.set_page_config(page_title="System Wypożyczalni Narzędzi", layout="wide")
-# --- SESJA I SYMULACJA ROLI ---
+# --- SESJA ---
 if "role" not in st.session_state:
-    # Możesz tu zmienić na "KIEROWNIK", "MAGAZYNIER", "KLIENT" lub None (Gość)
-    st.session_state.role = "KLIENT"
+    st.session_state.role = None
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "🏠 Start"
 
 db = SessionLocal()
 
 # --- MOCKOWANIE UŻYTKOWNIKA DLA TESTÓW ---
-if "user" not in st.session_state:
-    if st.session_state.role:
-        # Próbujemy pobrać z DB lub robimy Mock
-        test_user = db.query(models.Pracownik).first()  # Na potrzeby testu dowolny
-        if test_user:
-            st.session_state.user = test_user
-        else:
-            from types import SimpleNamespace
+# if "user" not in st.session_state or st.session_state.user is None:
+#     # Szukamy pierwszego lepszego kierownika w bazie danych
+#     test_boss = db.query(models.Pracownik).join(models.Kierownik).first()
+#
+#     if test_boss:
+#         st.session_state.user = test_boss
+#         st.session_state.role = "KIEROWNIK"
+#         st.session_state.current_page = "🏠 Start"
+#     else:
+#         # Jeśli baza jest pusta, tworzymy "udawanego" kierownika (Mock),
+#         # żeby UI się nie wywaliło, ale lepiej mieć kogoś w DB
+#         from types import SimpleNamespace
+#
+#         st.session_state.user = SimpleNamespace(
+#             id=1, imie="Szef", nazwisko="Testowy", email="admin@rental.pl"
+#         )
+#         st.session_state.role = "KIEROWNIK"
 
-            st.session_state.user = SimpleNamespace(id=999, imie="Tester", nazwisko="Serwisowy")
-    else:
-        st.session_state.user = None
 
-
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "🏠 Start"
 
 def navigate_to(page_name):
     st.session_state.current_page = page_name
     st.rerun()
 
+OPT_CHANGE_PASSWORD = "🔐 Zmiana hasła"
+
 # --- DEFINICJA MENU BOCZNEGO (Mapowanie ról) ---
 def get_menu_options(role):
     if role == "KIEROWNIK":
-        return ["🏠 Start", "🔐 Zmiana hasła", "🧰 Zarządzaj modelami", "👥 Zarządzaj kontami", "📊 Analiza danych",
+        return ["🏠 Start", OPT_CHANGE_PASSWORD, "🧰 Zarządzaj modelami", "👥 Zarządzaj kontami", "📊 Analiza danych",
                 "💾 Eksport danych"]
     elif role == "SERWISANT":
-        return ["🏠 Start", "🔧 Zarządzanie narzędziami", "🔐 Zmiana hasła"]
+        return ["🏠 Start", "🔧 Zarządzanie narzędziami", OPT_CHANGE_PASSWORD]
     elif role == "MAGAZYNIER":
-        return ["🏠 Start", "🔐 Zmiana hasła", "🔍 Przeglądaj narzędzia", "📦 Wypożyczenia", "📥 Przyjmij zasoby"]
+        return ["🏠 Start", OPT_CHANGE_PASSWORD, "🔍 Przeglądaj narzędzia", "📦 Wypożyczenia", "📥 Przyjmij zasoby"]
     elif role == "KLIENT":
-        return ["🏠 Start", "🔐 Zmiana hasła", "🛠 Dostępne narzędzia", "📜 Historia Wypożyczeń", "⚠️ Zgłoś usterkę"]
+        return ["🏠 Start", OPT_CHANGE_PASSWORD, "🛠 Dostępne narzędzia", "📜 Historia Wypożyczeń", "⚠️ Zgłoś usterkę"]
     else:  # Gość (None)
         return ["🏠 Start", "📝 Rejestracja", "🔑 Logowanie", "❓ Przypomnij hasło", "🛠 Dostępne narzędzia"]
 
@@ -157,11 +167,6 @@ if "Start" in choice:
         st.divider()
         st.warning("👋 Nie jesteś zalogowany. Przejdź do zakładki **Logowanie**, aby zarządzać rezerwacjami.")
 
-# 2. Zmiana hasła (Dla wszystkich zalogowanych)
-elif "Zmiana hasła" in choice:
-    st.header("🔐 Zmiana hasła")
-    # Tu później wstawisz formularz
-
 # 3. Widoki KIEROWNIKA
 elif "Zarządzaj modelami" in choice:
     # show_manager_ui z filtrem na modele
@@ -203,9 +208,15 @@ elif choice == "🔑 Logowanie":
 elif choice == "❓ Przypomnij hasło":
     from views.guest_view import show_forgot_password_view
     show_forgot_password_view(db, navigate_to)
-elif choice in ["📜 Historia Wypożyczeń"]:
-    st.title(f"Panel Klienta: {choice}")
-    st.info("Ten moduł zostanie zrealizowany w kolejnym kroku.")
+elif choice == OPT_CHANGE_PASSWORD:
+    from views.user_view import show_change_password_view
+    show_change_password_view(db)
+elif choice == "📜 Historia Wypożyczeń":
+    from views.client_view import show_rentals_history
+    show_rentals_history(db, st.session_state.user)
+elif choice == "⚠️ Zgłoś usterkę":
+    from views.client_view import show_report_fault_view
+    show_report_fault_view(db, st.session_state.user)
 
 db.close()
 
