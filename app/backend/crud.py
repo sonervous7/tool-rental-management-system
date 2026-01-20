@@ -5,8 +5,10 @@ import csv
 import hashlib
 import io
 import bcrypt
+import uuid
+from datetime import datetime, date, time
 
-from sqlalchemy import func, cast, Date
+from sqlalchemy import func, cast, Date, and_, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -291,20 +293,24 @@ def update_tool_model(db: Session, model_id: int, payload: schemas.ToolModelUpda
     return model
 
 
-def withdraw_tool_model(db: Session, model_id: int) -> None:
-    """
-    Soft-withdraw: sets wycofany=True.
-    """
-    model = db.get(models.ModelNarzedzia, model_id)
-    if not model:
-        raise ValueError("Model narzędzia nie istnieje.")
+def can_withdraw_model(db: Session, model_id: int) -> bool:
+    """Sprawdza, czy model nie ma przypisanych żadnych egzemplarzy."""
+    count = db.query(models.EgzemplarzNarzedzia).filter(
+        models.EgzemplarzNarzedzia.model_id == model_id
+    ).count()
+    return count == 0
 
-    model.wycofany = True
-    try:
+
+def withdraw_tool_model(db: Session, model_id: int):
+    """Wycofuje model, jeśli nie ma egzemplarzy."""
+    if not can_withdraw_model(db, model_id):
+        raise ValueError("Nie można wycofać modelu, który posiada przypisane egzemplarze!")
+
+    model = db.get(models.ModelNarzedzia, model_id)
+    if model:
+        model.wycofany = True
         db.commit()
-    except IntegrityError as e:
-        db.rollback()
-        raise ValueError("Nie można wycofać modelu narzędzia.") from e
+    return model
 
 
 def list_tool_models_for_manager(
@@ -351,6 +357,26 @@ def list_tool_models_for_manager(
     ]
 
 
+def list_tool_models_extended(
+        db: Session,
+        search: str = "",
+        cat: str = "Wszystkie",
+        prod: str = "Wszyscy",
+        min_price: float = 0.0,
+        max_price: float = 1000.0
+) -> list[models.ModelNarzedzia]:
+    query = db.query(models.ModelNarzedzia).filter(models.ModelNarzedzia.wycofany == False)
+
+    if search:
+        query = query.filter(models.ModelNarzedzia.nazwa_modelu.ilike(f"%{search}%"))
+    if cat != "Wszystkie":
+        query = query.filter(models.ModelNarzedzia.kategoria == cat)
+    if prod != "Wszyscy":
+        query = query.filter(models.ModelNarzedzia.producent == prod)
+
+    query = query.filter(models.ModelNarzedzia.cena_za_dobe.between(min_price, max_price))
+
+    return query.order_by(models.ModelNarzedzia.nazwa_modelu).all()
 
 def get_tool_model(db: Session, model_id: int) -> dict | None:
     m = db.get(models.ModelNarzedzia, model_id)
@@ -549,3 +575,320 @@ def export_table_to_csv(
         writer.writerow([getattr(r, col) for col in columns])
 
     return buf.getvalue()
+
+
+def authenticate_user(db: Session, login: str, password: str):
+    """Weryfikuje login/hasło i zwraca obiekt pracownika oraz jego rolę."""
+    user = db.query(models.Pracownik).filter(models.Pracownik.login == login).first()
+
+    if user and verify_password(password, user.haslo):
+        # Sprawdzamy rolę po tabelach podtypów
+        if user.kierownik: return user, "KIEROWNIK"
+        if user.magazynier: return user, "MAGAZYNIER"
+        if user.serwisant: return user, "SERWISANT"
+
+    return None, None
+
+# SERWISANT
+
+def add_service_action(
+    db: Session,
+    egzemplarz_id: int,
+    serwisant_id: int,
+    rodzaj: str,  # "NAPRAWA", "PRZEGLAD" lub "NOTATKA"
+    notatka: str,
+    nowy_stan: str = None  # Opcjonalna zmiana stanu technicznego
+):
+    """Realizuje PU 21, 22 i 23 - zapisuje czynność i opcjonalnie aktualizuje stan narzędzia."""
+    egzemplarz = db.get(models.EgzemplarzNarzedzia, egzemplarz_id)
+    if not egzemplarz:
+        raise ValueError("Nie znaleziono takiego egzemplarza.")
+
+    # 1. Tworzymy wpis w historii (zgodnie z Twoją relacją Serwisant -> Czynność)
+    nowa_czynnosc = models.CzynnoscSerwisowa(
+        egzemplarz_id=egzemplarz_id,
+        serwisant_id=serwisant_id,
+        rodzaj=rodzaj,
+        notatka_opis=notatka,
+        data_rozpoczecia=datetime.datetime.utcnow(),
+        data_zakonczenia=datetime.datetime.utcnow()
+    )
+    db.add(nowa_czynnosc)
+
+    # 2. Jeśli to naprawa lub przegląd, zazwyczaj przywracamy sprzęt do sprawności
+    if nowy_stan:
+        egzemplarz.stan_techniczny = nowy_stan
+        # Jeśli sprzęt naprawiony, wraca wirtualnie do magazynu
+        if nowy_stan == "SPRAWNY":
+            egzemplarz.status = "W_MAGAZYNIE"
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
+
+
+def list_pending_operations(db: Session):
+    """Poprawiona funkcja dla Magazyniera - używa Twoich nazw pól dat."""
+    from sqlalchemy.orm import joinedload
+
+    rentals = db.query(models.Wypozyczenie).options(
+        joinedload(models.Wypozyczenie.klient),
+        joinedload(models.Wypozyczenie.pozycje).joinedload(models.PozycjaWypozyczenia.egzemplarz).joinedload(
+            models.EgzemplarzNarzedzia.model)
+    ).filter(models.Wypozyczenie.status.in_(["REZERWACJA", "WYDANE"])).all()
+
+    results = []
+    for r in rentals:
+        modele_napis = ", ".join(list(set([p.egzemplarz.model.nazwa_modelu for p in r.pozycje])))
+
+        if r.status == "REZERWACJA":
+            results.append({
+                "id": r.id,
+                "typ": "WYDANIE",
+                "data_planowana": r.data_plan_wydania,  # Poprawione
+                "klient": f"{r.klient.imie} {r.klient.nazwisko}",
+                "model": modele_napis,
+                "obj": r
+            })
+        elif r.status == "WYDANE":
+            results.append({
+                "id": r.id,
+                "typ": "ZWROT",
+                "data_planowana": r.data_plan_zwrotu,  # Poprawione
+                "klient": f"{r.klient.imie} {r.klient.nazwisko}",
+                "model": modele_napis,
+                "obj": r
+            })
+    return results
+
+
+def process_rental_action(db: Session, rental_id: int, new_status: str):
+    """Aktualizuje status wypożyczenia (PU 24, 25)."""
+    rental = db.get(models.Wypozyczenie, rental_id)
+    if not rental:
+        raise ValueError("Nie znaleziono wypożyczenia.")
+
+    rental.status = new_status
+
+    # Dodatkowa logika: Jeśli wydajemy, zmieniamy status egzemplarzy na U_KLIENTA
+    # Jeśli odbieramy zwrot, zmieniamy status egzemplarzy na W_MAGAZYNIE
+    new_item_status = "U_KLIENTA" if new_status == "WYDANE" else "W_MAGAZYNIE"
+
+    for poz in rental.pozycje:
+        poz.egzemplarz.status = new_item_status
+
+    db.commit()
+    return rental
+
+def update_item_status(db: Session, item_id: int, new_status: str):
+    """Aktualizuje status lokalizacji egzemplarza (np. przekazanie do warsztatu)."""
+    item = db.get(models.EgzemplarzNarzedzia, item_id)
+    if item:
+        item.status = new_status
+        db.commit()
+        db.refresh(item)
+    return item
+
+
+def list_models_with_counts(db: Session, search: str = "", cat: str = "Wszystkie", prod: str = "Wszyscy"):
+    """Pobiera listę modeli wraz z aktualną liczbą posiadanych egzemplarzy."""
+    # Podzapytanie liczące sztuki dla każdego modelu
+    count_subquery = db.query(
+        models.EgzemplarzNarzedzia.model_id,
+        func.count(models.EgzemplarzNarzedzia.id).label('total')
+    ).group_by(models.EgzemplarzNarzedzia.model_id).subquery()
+
+    query = db.query(
+        models.ModelNarzedzia,
+        func.coalesce(count_subquery.c.total, 0).label('liczba_sztuk')
+    ).outerjoin(count_subquery, models.ModelNarzedzia.id == count_subquery.c.model_id).filter(
+        models.ModelNarzedzia.wycofany == False)
+
+    if search:
+        query = query.filter(models.ModelNarzedzia.nazwa_modelu.ilike(f"%{search}%"))
+    if cat != "Wszystkie":
+        query = query.filter(models.ModelNarzedzia.kategoria == cat)
+    if prod != "Wszyscy":
+        query = query.filter(models.ModelNarzedzia.producent == prod)
+
+    return query.all()
+
+
+def bulk_create_items(db: Session, model_id: int, count: int):
+    """Tworzy zadaną liczbę egzemplarzy zgodnie z modelem bazy danych."""
+    for _ in range(count):
+        # Generujemy unikalny ciąg, aby spełnić wymóg unikalności numeru seryjnego
+        temp_sn = f"SN-{uuid.uuid4().hex[:6].upper()}"
+
+        db_item = models.EgzemplarzNarzedzia(
+            model_id=model_id,
+            numer_seryjny=temp_sn,  # Wymagane przez model
+            status="W_MAGAZYNIE",  # Domyślnie
+            stan_techniczny="SPRAWNY"  # Domyślnie
+        )
+        db.add(db_item)
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise ValueError(f"Błąd bazy danych: {str(e)}")
+
+def mark_for_inspection(db: Session, item_id: int):
+    """Zmienia stan techniczny na WYMAGA_PRZEGLADU (PU 27/Operacyjne)."""
+    item = db.get(models.EgzemplarzNarzedzia, item_id)
+    if item and item.status == "W_MAGAZYNIE" and item.stan_techniczny == "SPRAWNY":
+        item.stan_techniczny = "WYMAGA_PRZEGLADU"
+        db.commit()
+    return item
+
+def receive_from_service(db: Session, item_id: int):
+    """Przyjmuje narzędzie z powrotem do magazynu (zmiana statusu z W_WARSZTACIE na W_MAGAZYNIE)."""
+    item = db.get(models.EgzemplarzNarzedzia, item_id)
+    if item and item.status == "W_WARSZTACIE":
+        item.status = "W_MAGAZYNIE"
+        item.warsztat_id = None # Czyszczenie relacji z warsztatem
+        db.commit()
+    return item
+
+def update_technical_state(db: Session, item_id: int, new_state: str):
+    """Zmienia stan techniczny egzemplarza (np. SPRAWNY <-> WYMAGA_PRZEGLADU)."""
+    item = db.get(models.EgzemplarzNarzedzia, item_id)
+    if item:
+        item.stan_techniczny = new_state
+        db.commit()
+    return item
+
+
+def count_physical_in_stock(db: Session, model_id: int):
+    """Szybki licznik dla tabeli głównej: fizycznie w magazynie i sprawne."""
+    return db.query(models.EgzemplarzNarzedzia).filter(
+        models.EgzemplarzNarzedzia.model_id == model_id,
+        models.EgzemplarzNarzedzia.status == "W_MAGAZYNIE",
+        models.EgzemplarzNarzedzia.stan_techniczny == "SPRAWNY"
+    ).count()
+
+
+def get_available_items_for_term(db: Session, model_id: int, start_dt: datetime, end_dt: datetime):
+    """Wylicza dostępność na podstawie Twoich pól: data_plan_wydania i data_plan_zwrotu."""
+    # 1. Wszystkie sprawne egzemplarze (poza warsztatem)
+    functional_items = db.query(models.EgzemplarzNarzedzia).filter(
+        models.EgzemplarzNarzedzia.model_id == model_id,
+        models.EgzemplarzNarzedzia.stan_techniczny == "SPRAWNY",
+        models.EgzemplarzNarzedzia.status != "W_WARSZTACIE"
+    ).all()
+
+    # 2. Sprawdzanie kolizji terminów w aktywnych wypożyczeniach
+    # Kolizja: planowany start <= wybrany koniec ORAZ planowany koniec >= wybrany start
+    busy_items_query = db.query(models.PozycjaWypozyczenia.egzemplarz_id).join(models.Wypozyczenie).filter(
+        models.Wypozyczenie.status.in_(["REZERWACJA", "WYDANE"]),
+        and_(
+            models.Wypozyczenie.data_plan_wydania <= end_dt,
+            models.Wypozyczenie.data_plan_zwrotu >= start_dt
+        )
+    )
+    busy_ids = [r[0] for r in busy_items_query.all()]
+
+    return [item for item in functional_items if item.id not in busy_ids]
+
+
+# app/backend/crud.py
+
+def create_reservation(db: Session, client_id: int, model_id: int, qty: int, start_dt: datetime, end_dt: datetime):
+    available = get_available_items_for_term(db, model_id, start_dt, end_dt)
+
+    if len(available) < qty:
+        raise ValueError(f"Brak wolnych sztuk.")
+
+    # Tworzymy nagłówek zgodnie z Twoim modelem
+    new_rental = models.Wypozyczenie(
+        klient_id=client_id,  # Musi istnieć w tabeli klienci!
+        status="REZERWACJA",
+        data_plan_wydania=start_dt,  # Twoje pole
+        data_plan_zwrotu=end_dt,  # Twoje pole
+        magazynier_wydaj_id=None,  # Jeszcze nie wydane
+        magazynier_przyjmij_id=None,  # Jeszcze nie zwrócone
+        koszt_calkowity=0.0  # Możesz tu wyliczyć cenę
+    )
+
+    db.add(new_rental)
+    db.flush()
+
+    for i in range(qty):
+        pos = models.PozycjaWypozyczenia(
+            wypozyczenie_id=new_rental.id,
+            egzemplarz_id=available[i].id
+        )
+        db.add(pos)
+
+    db.commit()
+    return new_rental
+
+
+def create_customer(db: Session, payload: schemas.CustomerCreate):
+    # Sprawdzenie czy email już istnieje
+    existing = db.query(models.Klient).filter(models.Klient.email == payload.email).first()
+    if existing:
+        raise ValueError("Użytkownik o tym adresie email już istnieje.")
+
+    # Tworzymy obiekt używając nazw kolumn widocznych w Twoim błędzie SQL
+    db_customer = models.Klient(
+        imie=payload.imie,
+        nazwisko=payload.nazwisko,
+        email=payload.email,
+        telefon=payload.telefon,
+        haslo=payload.haslo,
+        pytanie_pomocnicze=payload.pytanie_pomocnicze,
+        odp_na_pytanie_pom=payload.odpowiedz_pomocnicza
+    )
+
+    try:
+        db.add(db_customer)
+        db.commit()
+        db.refresh(db_customer)
+        return db_customer
+    except Exception as e:
+        db.rollback()
+        # Wyświetlamy dokładniejszy błąd, żeby wiedzieć co dokładnie nie pasuje
+        raise e
+
+
+def authenticate_user(db: Session, identifier: str, password: str):
+    # 1. Szukamy w pracownikach
+    emp = db.query(models.Pracownik).filter(
+        or_(models.Pracownik.login == identifier, models.Pracownik.email == identifier)
+    ).first()
+
+    if emp and emp.haslo == password:
+        # Sprawdzamy podtypy (relacje uselist=False zwrócą obiekt lub None)
+        if emp.kierownik:
+            return emp, "KIEROWNIK"
+        if emp.magazynier:
+            return emp, "MAGAZYNIER"
+        if emp.serwisant:
+            return emp, "SERWISANT"
+        return emp, "PRACOWNIK"
+
+    # 2. Szukamy w klientach
+    cust = db.query(models.Klient).filter(models.Klient.email == identifier).first()
+    if cust and cust.haslo == password:
+        return cust, "KLIENT"
+
+    return None, None
+
+def get_security_question_by_email(db: Session, email: str):
+    """Szuka klienta po emailu i zwraca jego pytanie pomocnicze."""
+    user = db.query(models.Klient).filter(models.Klient.email == email).first()
+    if user:
+        return user.pytanie_pomocnicze
+    return None
+
+def verify_security_answer(db: Session, email: str, answer: str):
+    """Sprawdza, czy odpowiedź na pytanie pomocnicze się zgadza."""
+    user = db.query(models.Klient).filter(
+        models.Klient.email == email,
+        models.Klient.odp_na_pytanie_pom == answer
+    ).first()
+    return user is not None

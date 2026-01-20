@@ -1,206 +1,211 @@
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import datetime
-from datetime import datetime, date, time
+# app/frontend/app.py
 import streamlit as st
-
 from app.backend.database import SessionLocal
-from app.backend import crud
-from app.backend.schemas import EmployeeCreate, EmployeeUpdate
+from app.backend import models
+from views.manager_view import show_manager_ui
+from views.technician_view import show_technician_ui
+# from views.technician_view import show_technician_ui # to zrobimy za chwilę
 
-st.set_page_config(page_title="Rental System – DEV", layout="wide")
+st.set_page_config(page_title="System Wypożyczalni Narzędzi", layout="wide")
+# --- SESJA I SYMULACJA ROLI ---
+if "role" not in st.session_state:
+    # Możesz tu zmienić na "KIEROWNIK", "MAGAZYNIER", "KLIENT" lub None (Gość)
+    st.session_state.role = "KLIENT"
 
-st.title("🛠 Rental System – Panel Kierownika (DEV)")
+db = SessionLocal()
 
+# --- MOCKOWANIE UŻYTKOWNIKA DLA TESTÓW ---
+if "user" not in st.session_state:
+    if st.session_state.role:
+        # Próbujemy pobrać z DB lub robimy Mock
+        test_user = db.query(models.Pracownik).first()  # Na potrzeby testu dowolny
+        if test_user:
+            st.session_state.user = test_user
+        else:
+            from types import SimpleNamespace
 
-def get_db():
-    return SessionLocal()
-
-
-# --- OKNO DIALOGOWE EDYCJI ---
-@st.dialog("Edycja danych pracownika")
-def edit_employee_dialog(emp, db):
-    st.write(f"Edytujesz: **{emp['imie']} {emp['nazwisko']}**")
-
-    with st.form("modal_edit_form"):
-        c1, c2 = st.columns(2)
-        new_imie = c1.text_input("Imię", value=emp['imie'])
-        new_nazwisko = c2.text_input("Nazwisko", value=emp['nazwisko'])
-        new_email = c1.text_input("Email", value=emp['email'] or "")
-        new_tel = c2.text_input("Telefon", value=emp['telefon'] or "")
-        new_adres = st.text_input("Adres", value=emp['adres'] or "")
-
-        st.markdown("---")
-        roles = ["KIEROWNIK", "MAGAZYNIER", "SERWISANT"]
-        new_rola = st.selectbox("Rola", roles, index=roles.index(emp['rola']) if emp['rola'] in roles else 0)
-
-        # Obsługa daty
-        curr_d = emp['zatrudniony_od'].date() if isinstance(emp['zatrudniony_od'], datetime) else date.today()
-        new_d = st.date_input("Data zatrudnienia w roli", value=curr_d)
-
-        if st.form_submit_button("Zapisz zmiany", use_container_width=True):
-            try:
-                # 1. Update danych podstawowych
-                crud.update_employee(db, emp['id'], payload=EmployeeUpdate(
-                    imie=new_imie, nazwisko=new_nazwisko, email=new_email,
-                    telefon=new_tel, adres=new_adres
-                ))
-                # 2. Update roli i daty
-                new_dt = datetime.combine(new_d, time.min)
-                crud.change_employee_role(db, emp['id'], new_rola, data_startu=new_dt)
-
-                st.success("Zapisano!")
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Błąd: {ex}")
+            st.session_state.user = SimpleNamespace(id=999, imie="Tester", nazwisko="Serwisowy")
+    else:
+        st.session_state.user = None
 
 
-menu = st.sidebar.selectbox(
-    "Menu",
-    [
-        "Pracownicy",
-        "Modele narzędzi",
-        "Analiza",
-        "Eksport",
-    ],
-)
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "🏠 Start"
 
-db = get_db()
+def navigate_to(page_name):
+    st.session_state.current_page = page_name
+    st.rerun()
 
-# -------------------------------------------------
-# PRACOWNICY
-# -------------------------------------------------
-if menu == "Pracownicy":
-    st.header("👷 Zarządzanie Kadrami")
+# --- DEFINICJA MENU BOCZNEGO (Mapowanie ról) ---
+def get_menu_options(role):
+    if role == "KIEROWNIK":
+        return ["🏠 Start", "🔐 Zmiana hasła", "🧰 Zarządzaj modelami", "👥 Zarządzaj kontami", "📊 Analiza danych",
+                "💾 Eksport danych"]
+    elif role == "SERWISANT":
+        return ["🏠 Start", "🔧 Zarządzanie narzędziami", "🔐 Zmiana hasła"]
+    elif role == "MAGAZYNIER":
+        return ["🏠 Start", "🔐 Zmiana hasła", "🔍 Przeglądaj narzędzia", "📦 Wypożyczenia", "📥 Przyjmij zasoby"]
+    elif role == "KLIENT":
+        return ["🏠 Start", "🔐 Zmiana hasła", "🛠 Dostępne narzędzia", "📜 Historia Wypożyczeń", "⚠️ Zgłoś usterkę"]
+    else:  # Gość (None)
+        return ["🏠 Start", "📝 Rejestracja", "🔑 Logowanie", "❓ Przypomnij hasło", "🛠 Dostępne narzędzia"]
 
-    # --- SEKCJA DODAWANIA NOWEGO PRACOWNIKA ---
-    with st.expander("➕ Dodaj nowego pracownika"):
-        with st.form("add_employee_new"):
-            c1, c2 = st.columns(2)
-            imie = c1.text_input("Imię")
-            nazwisko = c2.text_input("Nazwisko")
-            pesel = c1.text_input("PESEL (11 znaków)")
-            email = c2.text_input("Adres Email")
-            telefon = c1.text_input("Numer telefonu")
-            adres = c2.text_input("Adres zamieszkania")
 
-            login = c1.text_input("Login")
-            haslo = c2.text_input("Hasło", type="password")
-            rola = st.selectbox("Rola systemowa", ["KIEROWNIK", "MAGAZYNIER", "SERWISANT"])
+menu_options = get_menu_options(st.session_state.role)
 
-            # Data zatrudnienia dla nowej roli
-            data_zatr_new = st.date_input("Data zatrudnienia", value=date.today())
 
-            if st.form_submit_button("Utwórz konto pracownika"):
-                try:
-                    dt_zatr = datetime.combine(data_zatr_new, time.min)
-                    crud.create_employee(
-                        db,
-                        payload=EmployeeCreate(
-                            imie=imie, nazwisko=nazwisko, pesel=pesel,
-                            email=email if email else None,
-                            telefon=telefon if telefon else None,
-                            adres=adres if adres else None,
-                            login=login, haslo=haslo, rola=rola,
-                            data_zatrudnienia=dt_zatr
-                        ),
-                    )
-                    st.success(f"Dodano pracownika: {imie} {nazwisko}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Błąd: {str(e)}")
+# --- SIDEBAR ---
+with st.sidebar:
+    st.title("📂 System Rental")
 
-    # --- LISTA PRACOWNIKÓW ---
-    st.subheader("Lista aktywnych kont")
-    employees = crud.list_employees(db)
+    try:
+        current_index = menu_options.index(st.session_state.current_page)
+    except ValueError:
+        current_index = 0
 
-    if not employees:
-        st.info("Brak zarejestrowanych pracowników.")
-
-    for e in employees:
-        with st.expander(f"👤 {e['imie']} {e['nazwisko']} — {e['rola']}"):
-            col1, col2, col3 = st.columns([1, 1, 0.6])
-
-            with col1:
-                st.markdown("**Dane Kontaktowe**")
-                st.write(f"📧 Email: {e['email'] or 'brak'}")
-                st.write(f"📞 Tel: {e['telefon'] or 'brak'}")
-                st.write(f"🏠 Adres: {e['adres'] or 'brak'}")
-
-            with col2:
-                st.markdown("**Informacje Systemowe**")
-                st.write(f"🔑 Login: {e['login']}")
-                st.write(f"🆔 PESEL: {e['pesel']}")
-                if e['zatrudniony_od']:
-                    st.write(f"📅 Zatrudniony od: {e['zatrudniony_od'].strftime('%d.%m.%Y')}")
-
-            with col3:
-                st.markdown("**Akcje**")
-
-                # Klucze przycisków muszą być unikalne w pętli
-                # Edycja przez Okno Dialogowe (Modal)
-                if st.button("Edytuj", key=f"btn_edit_{e['id']}", use_container_width=True):
-                    edit_employee_dialog(e, db)
-
-                # Usuwanie
-                if st.button("Usuń", key=f"btn_del_{e['id']}", use_container_width=True):
-                    try:
-                        crud.delete_employee(db, e["id"])
-                        st.success("Konto usunięte")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
-
-# -------------------------------------------------
-# MODELE NARZĘDZI
-# -------------------------------------------------
-elif menu == "Modele narzędzi":
-    st.header("🧰 Modele narzędzi")
-
-    models = crud.list_tool_models_for_manager(db)
-
-    st.dataframe(models, use_container_width=True)
-
-# -------------------------------------------------
-# ANALIZA
-# -------------------------------------------------
-elif menu == "Analiza":
-    st.header("📊 Analiza")
-
-    col1, col2 = st.columns(2)
-    date_from = col1.date_input("Od")
-    date_to = col2.date_input("Do")
-
-    if st.button("Generuj"):
-        summary = crud.analytics_summary(db, date_from, date_to)
-        daily = crud.analytics_daily(db, date_from, date_to)
-
-        st.metric("Liczba wypożyczeń", summary["total_rentals"])
-        st.metric("Przychód", f"{summary['total_revenue']} zł")
-
-        st.line_chart(daily, x="dzien", y="liczba_wypozyczen")
-
-# -------------------------------------------------
-# EKSPORT
-# -------------------------------------------------
-elif menu == "Eksport":
-    st.header("⬇️ Eksport CSV")
-
-    table = st.selectbox(
-        "Tabela",
-        [
-            "pracownicy",
-            "modele_narzedzi",
-            "wypozyczenia",
-        ],
+    # Teraz radio korzysta z key="sidebar_nav", a navigate_to go modyfikuje
+    choice = st.radio(
+        "Nawigacja",
+        menu_options,
+        index=current_index
     )
 
-    if st.button("Eksportuj"):
-        csv_data = crud.export_table_to_csv(db, table)
-        st.download_button(
-            "Pobierz CSV",
-            data=csv_data,
-            file_name=f"{table}.csv",
-            mime="text/csv",
-        )
+    # Jeśli użytkownik kliknął w radio (zmienił wybór ręcznie), aktualizujemy stan
+    if choice != st.session_state.current_page:
+        st.session_state.current_page = choice
+        st.rerun()
+
+    # --- UNIWERSALNA STOPKA UŻYTKOWNIKA ---
+    # Pojawi się tylko, jeśli użytkownik jest zalogowany [cite: 381]
+    if st.session_state.user:
+        st.sidebar.markdown("---")
+        # Wykorzystujemy atrybuty z encji Pracownik [cite: 185, 189]
+        st.sidebar.markdown(f"👤 **{st.session_state.user.imie} {st.session_state.user.nazwisko}**")
+        st.sidebar.markdown(f"🏷️ Rola: `{st.session_state.role}`")
+
+        # Przycisk wylogowania (zgodnie z PU 19 i 40) [cite: 968, 1498]
+        if st.sidebar.button("Wyloguj się", use_container_width=True):
+            st.session_state.user = None
+            st.session_state.role = None
+            st.rerun()
+
+# --- LOGIKA RENDEROWANIA WIDOKÓW ---
+
+# 1. Start (Wspólny)
+if "Start" in choice:
+    # Nagłówek z ikoną
+    st.title("🏗️ Witaj w systemie zarządzania wypożyczalnią narzędzi!")
+
+    # Układ dwukolumnowy: Lewa (Główna treść), Prawa (Kontakt)
+    col_main, col_contact = st.columns([2, 1], gap="large")
+
+    with col_main:
+        st.markdown("""
+        ### 🛠️ Profesjonalny sprzęt na wyciągnięcie ręki
+        Nasza wypożyczalnia oferuje szeroki zakres narzędzi budowlanych, ogrodowych i specjalistycznych. 
+        Zaloguj się, aby sprawdzić dostępność i zarezerwować sprzęt online.
+        """)
+
+        # Fancy Regulamin - Sekcja rozwijana po kliknięciu
+        with st.expander("📄 Przeczytaj Regulamin Wypożyczalni"):
+            st.write("### Regulamin Wypożyczalni Narzędzi")
+
+            tab1, tab2, tab3 = st.tabs(["I. Rezerwacja", "II. Odbiór i Zwrot", "III. Usterki"])
+
+            with tab1:
+                st.markdown("**1. Rezerwacja i Wypożyczenie Online**")
+                st.write("- Wszystkie rezerwacje dokonywane są wyłącznie przez system online.")
+                st.write("- Potwierdzenie przez system gwarantuje dostępność narzędzia w wybranym terminie.")
+                st.write("- Anulowanie rezerwacji musi nastąpić min. 24h przed terminem odbioru.")
+
+            with tab2:
+                st.markdown("**II. Odbiór i Zwrot**")
+                st.write("- Przy odbiorze należy okazać dokument tożsamości i potwierdzenie rezerwacji.")
+                st.write("- Klient jest zobowiązany sprawdzić stan techniczny narzędzia przy odbiorze.")
+                st.write("- Narzędzie musi zostać zwrócone w terminie, czyste i kompletne.")
+
+            with tab3:
+                st.markdown("**III. Odpowiedzialność i Usterki**")
+                st.write("- W przypadku awarii należy niezwłocznie zaprzestać pracy i zgłosić usterkę online.")
+                st.write("- Klient ponosi odpowiedzialność za uszkodzenia wynikające z niewłaściwego użytkowania.")
+                st.write("- Zapewniamy naprawę lub wymianę, jeśli usterka nie wynikła z winy Klienta.")
+
+    with col_contact:
+        # Panel boczny z danymi kontaktowymi w "fancy" ramce
+        with st.container(border=True):
+            st.subheader("📞 Dane kontaktowe")
+            st.markdown(f"""
+            **Narzędziarnia Express Sp. z o.o.**
+
+            📍 {892 if False else 'ul. Przemysłowa 54/A'}  
+            🏙️ 30-701 Kraków
+
+            ☎️ **{903 if False else '+48 123 456 789'}**  
+            📧 {903 if False else 'kontakt@narzedziarnia.pl'}
+
+            **NIP:** 676-249-12-00
+            """)
+
+            st.divider()
+            st.info(f"🕒 **Godziny otwarcia:** \nPon - Pt: 7:00 - 17:00")
+
+    # Stopka zachęcająca do działania dla niezalogowanych
+    if not st.session_state.user:
+        st.divider()
+        st.warning("👋 Nie jesteś zalogowany. Przejdź do zakładki **Logowanie**, aby zarządzać rezerwacjami.")
+
+# 2. Zmiana hasła (Dla wszystkich zalogowanych)
+elif "Zmiana hasła" in choice:
+    st.header("🔐 Zmiana hasła")
+    # Tu później wstawisz formularz
+
+# 3. Widoki KIEROWNIKA
+elif "Zarządzaj modelami" in choice:
+    # show_manager_ui z filtrem na modele
+    show_manager_ui(db, section="Modele")
+elif "Zarządzaj kontami" in choice:
+    show_manager_ui(db, section="Pracownicy")
+elif "Analiza danych" in choice:
+    show_manager_ui(db, section="Analiza")
+elif "Eksport danych" in choice:
+    show_manager_ui(db, section="Eksport")
+
+# 4. Widoki SERWISANTA
+elif "Zarządzanie narzędziami" in choice:
+    show_technician_ui(db, st.session_state.user)
+
+# 5. Widoki MAGAZYNIERA (Placeholdery)
+elif choice == "🔍 Przeglądaj narzędzia":
+    from views.warehouse_view import show_warehouseman_ui
+    show_warehouseman_ui(db, st.session_state.user, "Przeglądaj narzędzia")
+
+elif choice == "📦 Wypożyczenia":
+    from views.warehouse_view import show_warehouseman_ui
+    show_warehouseman_ui(db, st.session_state.user, "Wypożyczenia")
+
+elif choice == "📥 Przyjmij zasoby":
+    from views.warehouse_view import show_warehouseman_ui
+    show_warehouseman_ui(db, st.session_state.user, "Przyjmij zasoby")
+# app/frontend/app.py
+elif choice == "🛠 Dostępne narzędzia":
+    from views.client_view import show_client_catalog
+    show_client_catalog(db, st.session_state.user)
+# 6. Widoki KLIENTA / GOŚCIA
+elif choice == "📝 Rejestracja":
+    from views.guest_view import show_registration_view
+    show_registration_view(db)
+elif choice == "🔑 Logowanie":
+    from views.guest_view import show_login_view
+    show_login_view(db, navigate_to)
+elif choice == "❓ Przypomnij hasło":
+    from views.guest_view import show_forgot_password_view
+    show_forgot_password_view(db, navigate_to)
+elif choice in ["📜 Historia Wypożyczeń"]:
+    st.title(f"Panel Klienta: {choice}")
+    st.info("Ten moduł zostanie zrealizowany w kolejnym kroku.")
+
+db.close()
+

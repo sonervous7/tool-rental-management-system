@@ -127,7 +127,7 @@ class Klient(Base):
     haslo = Column(String(255), nullable=False)
     data_rejestracji = Column(DateTime, default=dt.datetime.utcnow, nullable=False)
 
-    # jeśli masz w ERD/potrzebujesz (np. do resetu hasla/pytania pom):
+    pytanie_pomocnicze = Column(String(255), nullable=True)
     odp_na_pytanie_pom = Column(String(255), nullable=True)
 
     wypozyczenia = relationship("Wypozyczenie", back_populates="klient")

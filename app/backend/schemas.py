@@ -1,14 +1,25 @@
 # app/backend/schemas.py
 # Pydantic v2 schemas (minimal set) covering mockups / use-cases
-
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, validator, field_validator
 
+
+def validate_password_strength(v: str) -> str:
+    if len(v) < 8:
+        raise ValueError("musi mieć co najmniej 8 znaków")
+    if not re.search(r"[A-Z]", v):
+        raise ValueError("musi zawierać co najmniej jedną wielką literę")
+    if not re.search(r"\d", v):
+        raise ValueError("musi zawierać co najmniej jedną cyfrę")
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>|]", v):
+        raise ValueError("musi zawierać co najmniej jeden znak specjalny")
+    return v
 
 # =========================================================
 # Base config for SQLAlchemy ORM objects
@@ -58,27 +69,28 @@ EmployeeRole = Literal["KIEROWNIK", "MAGAZYNIER", "SERWISANT"]
 class EmployeeCreate(BaseModel):
     imie: str = Field(..., max_length=50)
     nazwisko: str = Field(..., max_length=50)
-
-    pesel: str = Field(..., min_length=11, max_length=11)  # if you require it in UI
+    pesel: str = Field(..., min_length=11, max_length=11)
     telefon: Optional[str] = Field(None, max_length=15)
     email: Optional[EmailStr] = None
-
     adres: Optional[str] = Field(None, max_length=255)
-
     login: str = Field(..., max_length=30)
-    haslo: str = Field(..., max_length=255)
-
-    rola: EmployeeRole
+    haslo: str = Field(..., max_length=255) # Walidacja poniżej
+    rola: str # EmployeeRole (zależy jak masz zdefiniowany Enum)
     data_zatrudnienia: Optional[datetime] = None
 
+    @field_validator("haslo")
+    @classmethod
+    def check_password_strength(cls, v):
+        return validate_password_strength(v)
+
 class EmployeeUpdate(BaseModel):
-    imie: Optional[str] = Field(None, max_length=50)
-    nazwisko: Optional[str] = Field(None, max_length=50)
-    telefon: Optional[str] = Field(None, max_length=15)
+    imie: Optional[str] = Field(None, min_length=1, max_length=50)
+    nazwisko: Optional[str] = Field(None, min_length=1, max_length=50)
+    telefon: Optional[str] = Field(None, min_length=1, max_length=15)
     email: Optional[EmailStr] = None
-    adres: Optional[str] = Field(None, max_length=255)
-    login: Optional[str] = Field(None, max_length=30)
-    rola: Optional[EmployeeRole] = None  # change role
+    adres: Optional[str] = Field(None, min_length=1, max_length=255)
+    login: Optional[str] = Field(None, min_length=1, max_length=30)
+    rola: Optional[EmployeeRole] = None
 
 
 class EmployeeRead(ORMBase):
@@ -97,17 +109,27 @@ class EmployeeRead(ORMBase):
 # CLIENT (self-registration)
 # =========================================================
 
-class ClientRegisterRequest(BaseModel):
-    imie: str = Field(..., max_length=50)
-    nazwisko: str = Field(..., max_length=50)
-    telefon: Optional[str] = Field(None, max_length=15)
+class CustomerCreate(BaseModel):
+    imie: str = Field(..., min_length=2, max_length=50)
+    nazwisko: str = Field(..., min_length=2, max_length=50)
     email: EmailStr
+    telefon: str = Field(..., pattern=r"^\+?[0-9\s\-]{9,15}$")
+    pytanie_pomocnicze: str
+    odpowiedz_pomocnicza: str = Field(..., min_length=1)
+    haslo: str
+    haslo_powtorz: str
 
-    odp_na_pytanie_pom: str = Field(..., max_length=255)
+    @field_validator("haslo")
+    @classmethod
+    def password_rules(cls, v):
+        return validate_password_strength(v)
 
-    haslo: str = Field(..., max_length=255)
-    powtorz_haslo: str = Field(..., max_length=255)
-
+    @field_validator("haslo_powtorz")
+    @classmethod
+    def passwords_match(cls, v, info):
+        if "haslo" in info.data and v != info.data["haslo"]:
+            raise ValueError("Hasła nie są identyczne")
+        return v
 
 class ClientRead(ORMBase):
     id: int
