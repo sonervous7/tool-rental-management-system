@@ -1,338 +1,305 @@
 import streamlit as st
-import datetime
+import pandas as pd
 from datetime import datetime, date, time, timedelta
-from app.backend import crud, models, schemas
 from pydantic import ValidationError
 
 
+# --- FUNKCJE CACHE ---
+
+@st.cache_data(ttl=600)
+def get_cached_employees(_api):
+    resp = _api.get("/users/employees")
+    return resp.json() if resp and resp.status_code == 200 else []
+
+
+@st.cache_data(ttl=600)
+def get_cached_models(_api):
+    resp = _api.get("/inventory/models")
+    return resp.json() if resp and resp.status_code == 200 else []
+
+
+@st.cache_data(ttl=60)
+def get_cached_analytics(_api, date_from, date_to):
+    params = {"date_from": str(date_from), "date_to": str(date_to)}
+    resp = _api.get("/analytics/summary", params=params)
+    return resp.json() if resp and resp.status_code == 200 else None
+
+
+# --- HELPERY DO BŁĘDÓW ---
+def show_clean_pydantic_error(errors):
+    if hasattr(errors, 'errors'):
+        error_list = errors.errors()
+    elif isinstance(errors, list):
+        error_list = errors
+    else:
+        st.error(f"❌ Wystąpił nieoczekiwany błąd: {errors}")
+        return
+
+    translations = {
+        "string_too_short": "jest za krótkie (min. {min_length} znaków).",
+        "string_too_long": "jest za długie (max. {max_length} znaków).",
+        "value_error.missing": "jest wymagane.",
+        "assertion_error": "ma niepoprawną wartość.",
+        "value_error.email": "musi być poprawnym adresem e-mail."
+    }
+
+    for err in error_list:
+        field_raw = err['loc'][-1]
+        field_name = field_raw.replace("_", " ").capitalize()
+        err_type = err.get('type', '')
+        ctx = err.get('ctx', {})
+        msg = translations.get(err_type, err.get('msg', 'niepoprawne dane.'))
+        if "{" in msg:
+            msg = msg.format(**ctx)
+        st.error(f"⚠️ **{field_name}**: {msg}")
+
+
+# --- DIALOGI ---
+
 @st.dialog("Zarządzaj Modelem Narzędzia")
-def tool_model_dialog(db, model=None):
+def tool_model_dialog(api, model=None):
+    from app.backend.modules.inventory import schemas as inv_schemas
     mode = "Edytuj" if model else "Dodaj"
     st.subheader(f"{mode} model narzędzia")
+    m = model if model else {}
+
     with st.form("tool_model_form"):
-        nazwa = st.text_input("Nazwa modelu", value=model.nazwa_modelu if model else "")
-        prod = st.text_input("Producent", value=model.producent if model else "")
-        kat = st.text_input("Kategoria", value=model.kategoria if model else "")
-        opis = st.text_area("Opis", value=model.opis if model else "")
+        nazwa = st.text_input("Nazwa modelu", value=m.get('nazwa_modelu', ""))
+        prod = st.text_input("Producent", value=m.get('producent', ""))
+        kat = st.text_input("Kategoria", value=m.get('kategoria', ""))
+        opis = st.text_area("Opis", value=m.get('opis', ""))
         c1, c2 = st.columns(2)
-        cena = c1.number_input("Cena za dobę (zł)", min_value=0.0, value=float(model.cena_za_dobe) if model else 50.0)
-        kaucja = c2.number_input("Kaucja (zł)", min_value=0.0, value=float(model.kaucja) if model else 100.0)
+        val_cena = float(m.get('cena_za_dobe', 50.0))
+        val_kaucja = float(m.get('kaucja', 100.0))
+        cena = c1.number_input("Cena za dobę (zł)", min_value=0.0, value=val_cena)
+        kaucja = c2.number_input("Kaucja (zł)", min_value=0.0, value=val_kaucja)
 
         if st.form_submit_button("Zapisz", use_container_width=True):
             try:
+                payload = inv_schemas.ToolModelCreate(
+                    nazwa_modelu=nazwa, producent=prod, kategoria=kat,
+                    opis=opis, cena_za_dobe=cena, kaucja=kaucja
+                )
+                p_json = payload.model_dump(mode='json')
+
                 if model:
-                    crud.update_tool_model(db, model.id, schemas.ToolModelUpdate(
-                        nazwa_modelu=nazwa, producent=prod, kategoria=kat, opis=opis,
-                        cena_za_dobe=cena, kaucja=kaucja
-                    ))
+                    resp = api.patch(f"/inventory/models/{m['id']}", data=p_json)
                 else:
-                    crud.create_tool_model(db, schemas.ToolModelCreate(
-                        nazwa_modelu=nazwa, producent=prod, kategoria=kat, opis=opis,
-                        cena_za_dobe=cena, kaucja=kaucja
-                    ))
-                st.success("Zapisano!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Błąd: {e}")
+                    resp = api.post("/inventory/models", data=p_json)
+
+                if resp is not None and resp.status_code in [200, 201]:
+                    st.cache_data.clear()
+                    st.success("✅ Zapisano pomyślnie!")
+                    st.rerun()
+                elif resp is not None:
+                    show_clean_pydantic_error(resp.json().get('detail', []))
+            except ValidationError as e:
+                show_clean_pydantic_error(e)
+
+
+@st.dialog("Potwierdź wycofanie")
+def withdraw_confirm_dialog(api, model):
+    st.warning(f"Czy na pewno chcesz wycofać model: **{model['nazwa_modelu']}**?")
+    if st.button("Potwierdzam wycofanie", type="primary", use_container_width=True):
+        resp = api.patch(f"/inventory/models/{model['id']}", data={"wycofany": True})
+        if resp and resp.status_code == 200:
+            st.cache_data.clear()
+            st.success("Model wycofany!")
+            st.rerun()
+        else:
+            st.error("Nie udało się wycofać modelu.")
 
 
 @st.dialog("Edycja danych pracownika")
-def edit_employee_dialog(emp, db):
-
-
+def edit_employee_dialog(emp, api):
     st.write(f"Edytujesz profil: **{emp['imie']} {emp['nazwisko']}**")
-
     with st.form("edit_form_modal"):
         c1, c2 = st.columns(2)
-        # Streamlit domyślnie zwraca "", jeśli pole jest puste
         new_imie = c1.text_input("Imię*", value=emp['imie'])
         new_nazwisko = c2.text_input("Nazwisko*", value=emp['nazwisko'])
         new_email = c1.text_input("Email*", value=emp['email'] or "")
         new_tel = c2.text_input("Telefon", value=emp['telefon'] or "")
         new_adres = st.text_input("Adres zamieszkania", value=emp['adres'] or "")
-
-        st.markdown("---")
         roles = ["KIEROWNIK", "MAGAZYNIER", "SERWISANT"]
-        current_role_idx = roles.index(emp['rola']) if emp['rola'] in roles else 0
-        new_rola = st.selectbox("Rola systemowa", roles, index=current_role_idx)
-
-        current_hire_date = emp['zatrudniony_od'].date() if isinstance(emp['zatrudniony_od'],
-                                                                       datetime) else date.today()
-        new_date_zatr = st.date_input("Data rozpoczęcia pracy w tej roli", value=current_hire_date)
+        new_rola = st.selectbox("Rola systemowa", roles, index=roles.index(emp['rola']) if emp['rola'] in roles else 0)
 
         if st.form_submit_button("Zapisz zmiany", use_container_width=True):
-            # Prosta walidacja wstępna w UI (wizualna)
-            if not new_imie or not new_nazwisko or not new_email:
-                st.error("❌ Pola oznaczone gwiazdką (*) nie mogą być puste!")
-                return
-
             try:
-                # Próba walidacji przez Pydantic
-                update_data = schemas.EmployeeUpdate(
-                    imie=new_imie,
-                    nazwisko=new_nazwisko,
-                    email=new_email,
+                from app.backend.modules.users import schemas as user_schemas
+                update_data = user_schemas.EmployeeUpdate(
+                    imie=new_imie, nazwisko=new_nazwisko, email=new_email,
                     telefon=new_tel if new_tel else None,
-                    adres=new_adres if new_adres else None
+                    adres=new_adres if new_adres else None, rola=new_rola
                 )
-
-                # Jeśli Pydantic przepuścił, robimy update
-                crud.update_employee(db, emp['id'], payload=update_data)
-
-                new_dt = datetime.combine(new_date_zatr, time.min)
-                crud.change_employee_role(db, emp['id'], new_rola, data_startu=new_dt)
-
-                st.success("Dane zostały zaktualizowane!")
-                st.rerun()
-
+                resp = api.patch(f"/users/employees/{emp['id']}", data=update_data.model_dump())
+                if resp and resp.status_code == 200:
+                    st.cache_data.clear()  # Czyścimy cache pracowników
+                    st.success("Zaktualizowano dane!")
+                    st.rerun()
+                else:
+                    show_clean_pydantic_error(resp.json().get('detail', []))
             except ValidationError as e:
-                # Tutaj używamy naszego helpera od "ładnych błędów"
                 show_clean_pydantic_error(e)
-            except Exception as ex:
-                st.error(f"Wystąpił błąd: {ex}")
 
-@st.dialog("Potwierdź wycofanie")
-def withdraw_confirm_dialog(db, model):
-    st.warning(f"Czy na pewno chcesz wycofać model: {model.nazwa_modelu}?")
-    st.write("Tej operacji nie można cofnąć, jeśli model jest już niepotrzebny.")
 
-    if st.button("Potwierdzam wycofanie", type="primary", use_container_width=True):
-        try:
-            crud.withdraw_tool_model(db, model.id)
-            st.success("Model wycofany!")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
+# --- GŁÓWNE SEKCJE ---
 
-def show_manager_ui(db, section):
-
-    if section == "Pracownicy":
-        render_employees_section(db)
-    elif section == "Modele":
-        render_models_section(db)
-    elif section == "Analiza":
-        render_analytics_section(db)
-    elif section == "Eksport":
-        render_export_section(db)
-
-def render_employees_section(db):
+def render_employees_section(api):
+    from app.backend.modules.users import schemas as user_schemas
     st.header("👷 Zarządzanie Kadrami")
 
-    # --- SEKCJA DODAWANIA NOWEGO PRACOWNIKA ---
     with st.expander("➕ Dodaj nowego pracownika"):
         with st.form("add_employee_new"):
             c1, c2 = st.columns(2)
             imie = c1.text_input("Imię")
             nazwisko = c2.text_input("Nazwisko")
-            pesel = c1.text_input("PESEL (11 znaków)")
-            email = c2.text_input("Adres Email")
-            telefon = c1.text_input("Numer telefonu")
-            adres = c2.text_input("Adres zamieszkania")
+            c3, c4 = st.columns(2)
+            pesel = c3.text_input("PESEL (11 cyfr)")
+            email = c4.text_input("Adres Email")
+            c5, c6 = st.columns(2)
+            login = c5.text_input("Login")
+            haslo = c6.text_input("Hasło", type="password")
+            c7, c8 = st.columns(2)
+            telefon = c7.text_input("Numer telefonu")
+            rola = c8.selectbox("Rola systemowa", ["KIEROWNIK", "MAGAZYNIER", "SERWISANT"])
+            adres = st.text_input("Adres zamieszkania (Ulica, nr, miasto)")
 
-            login = c1.text_input("Login")
-            haslo = c2.text_input("Hasło", type="password")
-            rola = st.selectbox("Rola systemowa", ["KIEROWNIK", "MAGAZYNIER", "SERWISANT"])
-
-            # Data zatrudnienia dla nowej roli
-            data_zatr_new = st.date_input("Data zatrudnienia", value=date.today())
-
-            if st.form_submit_button("Utwórz konto pracownika"):
+            if st.form_submit_button("🚀 Utwórz konto pracownicze", use_container_width=True):
                 try:
-                    dt_zatr = datetime.combine(data_zatr_new, time.min)
-                    crud.create_employee(
-                        db,
-                        payload=schemas.EmployeeCreate(
-                            imie=imie, nazwisko=nazwisko, pesel=pesel,
-                            email=email if email else None,
-                            telefon=telefon if telefon else None,
-                            adres=adres if adres else None,
-                            login=login, haslo=haslo, rola=rola,
-                            data_zatrudnienia=dt_zatr
-                        ),
+                    payload = user_schemas.EmployeeCreate(
+                        imie=imie, nazwisko=nazwisko, pesel=pesel, email=email,
+                        login=login, haslo=haslo, rola=rola, adres=adres,
+                        telefon=telefon, data_zatrudnienia=None
                     )
-                    st.success(f"Dodano pracownika: {imie} {nazwisko}")
-                    st.rerun()
+                    resp = api.post("/users/employees", data=payload.model_dump(mode='json'))
+                    if resp and resp.status_code == 201:
+                        st.cache_data.clear()
+                        st.success(f"✅ Dodano pracownika!")
+                        st.rerun()
+                    elif resp:
+                        show_clean_pydantic_error(resp.json().get('detail', []))
                 except ValidationError as e:
                     show_clean_pydantic_error(e)
-                except ValueError as e:
-                    # Tutaj wpadają błędy z bazy (np. duplikacja PESEL w DB)
-                    st.error(f"⚠️ {str(e)}")
-                except Exception as e:
-                    st.error(f"🔥 Nieoczekiwany błąd: {str(e)}")
-
-    # --- LISTA PRACOWNIKÓW ---
-    st.subheader("Lista aktywnych kont")
-    employees = crud.list_employees(db)
-
-    if not employees:
-        st.info("Brak zarejestrowanych pracowników.")
-
-    for e in employees:
-        with st.expander(f"👤 {e['imie']} {e['nazwisko']} — {e['rola']}"):
-            col1, col2, col3 = st.columns([1, 1, 0.6])
-
-            with col1:
-                st.markdown("**Dane Kontaktowe**")
-                st.write(f"📧 Email: {e['email'] or 'brak'}")
-                st.write(f"📞 Tel: {e['telefon'] or 'brak'}")
-                st.write(f"🏠 Adres: {e['adres'] or 'brak'}")
-
-            with col2:
-                st.markdown("**Informacje Systemowe**")
-                st.write(f"🔑 Login: {e['login']}")
-                st.write(f"🆔 PESEL: {e['pesel']}")
-                if e['zatrudniony_od']:
-                    st.write(f"📅 Zatrudniony od: {e['zatrudniony_od'].strftime('%d.%m.%Y')}")
-
-            with col3:
-                st.markdown("**Akcje**")
-
-                # Klucze przycisków muszą być unikalne w pętli
-                # Edycja przez Okno Dialogowe (Modal)
-                if st.button("Edytuj", key=f"btn_edit_{e['id']}", use_container_width=True):
-                    edit_employee_dialog(e, db)
-
-                # Usuwanie
-                if st.button("Usuń", key=f"btn_del_{e['id']}", use_container_width=True):
-                    try:
-                        crud.delete_employee(db, e["id"])
-                        st.success("Konto usunięte")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
-
-def render_models_section(db):
-    st.header("🧰 Katalog Modeli")
-    # --- FILTRY ---
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        search_q = c1.text_input("🔍 Szukaj modelu", placeholder="Np. Wiertarka...")
-
-        # Pobieramy unikalne wartości do filtrów
-        all_models = db.query(models.ModelNarzedzia).all()
-        categories = ["Wszystkie"] + sorted(list(set(m.kategoria for m in all_models if m.kategoria)))
-        producers = ["Wszyscy"] + sorted(list(set(m.producent for m in all_models if m.producent)))
-
-        f_cat = c2.selectbox("Kategoria", categories)
-        f_prod = c3.selectbox("Producent", producers)
-
-        price_range = st.slider("Zakres ceny za dobę (zł)", 0, 10000, (0, 10000))
-
-        if st.button("Resetuj filtry", use_container_width=True):
-            st.rerun()
-
-    # --- LISTA ---
-    tool_models = crud.list_tool_models_extended(
-        db, search=search_q, cat=f_cat, prod=f_prod,
-        min_price=price_range[0], max_price=price_range[1]
-    )
-
-    if not tool_models:
-        st.info("Nie znaleziono modeli spełniających kryteria.")
-    else:
-        # Nagłówki tabeli
-        h1, h2, h3, h4, h5 = st.columns([2, 1, 1, 1, 1.5])
-        h1.write("**Nazwa / Producent**")
-        h2.write("**Kategoria**")
-        h3.write("**Cena**")
-        h4.write("**Kaucja**")
-        h5.write("**Akcje**")
-        st.divider()
-
-        for m in tool_models:
-            r1, r2, r3, r4, r5 = st.columns([2, 1, 1, 1, 1.5])
-            r1.write(f"**{m.nazwa_modelu}** \n_{m.producent}_")
-            r2.write(m.kategoria)
-            r3.write(f"{m.cena_za_dobe} zł")
-            r4.write(f"{m.kaucja} zł")
-
-            with r5:
-                ca1, ca2 = st.columns(2)
-                if ca1.button("Edytuj", key=f"edit_m_{m.id}"):
-                    tool_model_dialog(db, m)
-
-                # Przycisk wycofaj
-                if ca2.button("Wycofaj", key=f"with_m_{m.id}", type="secondary"):
-                    withdraw_confirm_dialog(db, m)
 
     st.divider()
-    if st.button("➕ Dodaj nowy model narzędzia", type="primary"):
-        tool_model_dialog(db)
+    employees = get_cached_employees(api)  # POBIERANIE Z CACHE
+    if employees:
+        for e in employees:
+            with st.expander(f"👤 {e['imie']} {e['nazwisko']} — **{e['rola']}**"):
+                col1, col2, col3 = st.columns([1.5, 1.5, 1])
+                with col1:
+                    st.write(f"📧 **Email:** {e.get('email', 'brak')}")
+                    st.write(f"📞 **Tel:** {e.get('telefon', 'brak')}")
+                with col2:
+                    st.write(f"🔑 **Login:** `{e.get('login', 'n/a')}`")
+                    st.write(f"🏠 **Adres:** {e.get('adres', 'brak')}")
+                with col3:
+                    if st.button("✏️ Edytuj", key=f"ed_emp_{e['id']}", use_container_width=True):
+                        edit_employee_dialog(e, api)
+                    if st.button("🗑️ Usuń", key=f"del_emp_{e['id']}", type="secondary", use_container_width=True):
+                        if api.delete(f"/users/employees/{e['id']}"):
+                            st.cache_data.clear()
+                            st.toast(f"Usunięto konto: {e['imie']}")
+                            st.rerun()
 
 
-def render_analytics_section(db):
-    st.subheader("📊 Statystyki i Analiza")
+def render_models_section(api):
+    st.header("🧰 Katalog Modeli")
+    all_data = get_cached_models(api)  # POBIERANIE Z CACHE
+    if not all_data:
+        st.info("Brak modeli. Dodaj pierwszy model poniżej.")
+    else:
+        models_list = [m['ModelNarzedzia'] for m in all_data]
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            search_q = c1.text_input("🔍 Szukaj modelu")
+            categories = ["Wszystkie"] + sorted(list(set(m['kategoria'] for m in models_list)))
+            producers = ["Wszyscy"] + sorted(list(set(m['producent'] for m in models_list)))
+            f_cat = c2.selectbox("Kategoria", categories)
+            f_prod = c3.selectbox("Producent", producers)
+            price_range = st.slider("Zakres ceny za dobę (zł)", 0, 2000, (0, 2000))
 
-    # 1. Zakres dat
-    today = date.today()
-    default_start = today - timedelta(days=7)  # Krótszy zakres domyślny, by widzieć testy
-
-    date_range = st.date_input("Zakres analizy", [default_start, today])
-
-    if len(date_range) == 2:
-        date_from, date_to = date_range
-
-        # 2. Pobranie danych
-        summary = crud.analytics_summary(db, date_from, date_to)
-        daily_data = crud.analytics_daily(db, date_from, date_to)
-
-        # 3. Wyświetlenie metryk (Summary)
-        c1, c2 = st.columns(2)
-        c1.metric("Liczba rezerwacji", summary["total_rentals"])
-        c2.metric("Wartość zamówień", f"{summary['total_revenue']:.2f} zł")
+        filtered = [m for m in models_list if
+                    (search_q.lower() in m['nazwa_modelu'].lower()) and
+                    (f_cat == "Wszystkie" or m['kategoria'] == f_cat) and
+                    (f_prod == "Wszyscy" or m['producent'] == f_prod) and
+                    (price_range[0] <= m['cena_za_dobe'] <= price_range[1])]
 
         st.divider()
+        for m in filtered:
+            r1, r2, r3, r4, r5 = st.columns([2, 1, 1, 1, 1.5])
+            r1.write(f"**{m['nazwa_modelu']}** \n_{m['producent']}_")
+            r2.write(m['kategoria']);
+            r3.write(f"{m['cena_za_dobe']} zł");
+            r4.write(f"{m['kaucja']} zł")
+            with r5:
+                if st.button("✏️ Edytuj", key=f"edm_{m['id']}", use_container_width=True):
+                    tool_model_dialog(api, m)
 
-        # 4. Wykres (Daily)
-        if daily_data:
-            import pandas as pd
-            df = pd.DataFrame(daily_data, columns=["Data", "Suma"])
+    st.divider()
+    if st.button("➕ Dodaj nowy model", type="primary", use_container_width=True):
+        tool_model_dialog(api)
 
-            st.write("**Przychód dzień po dniu (wg daty rezerwacji):**")
-            st.line_chart(df.set_index("Data"), use_container_width=True)
 
-            # Tabela pomocnicza dla Kierownika
-            with st.expander("👁️ Pokaż dane tabelaryczne"):
-                st.dataframe(df, use_container_width=True)
+def render_analytics_section(api):
+    st.header("📊 Statystyki i Raporty")
+
+    c1, c2 = st.columns(2)
+    d_from = c1.date_input("Od", date.today() - timedelta(days=30))
+    d_to = c2.date_input("Do", date.today())
+
+    summary = api.get("/analytics/summary", params={"date_from": d_from, "date_to": d_to}).json()
+    top_models = api.get("/analytics/top-models", params={"limit": 10}).json()
+    categories = api.get("/analytics/categories").json()
+
+    if summary:
+        m1, m2 = st.columns(2)
+        m1.metric("Łącznie rezerwacji", summary['total_rentals'])
+        m2.metric("Całkowity przychód", f"{summary['total_revenue']:.2f} zł")
+
+        st.subheader("📈 Przychód dzień po dniu")
+        if summary['daily_stats']:
+            df_daily = pd.DataFrame(summary['daily_stats'])
+            df_daily['date'] = pd.to_datetime(df_daily['date'])
+            df_daily = df_daily.set_index('date')
+            st.area_chart(df_daily['revenue'], color="#34495E")
         else:
-            st.info("Brak rezerwacji w wybranym terminie. Spróbuj zmienić datę w kalendarzu na dzisiejszą.")
-    else:
-        st.warning("Proszę wybrać zakres (datę początkową i końcową).")
+            st.info("Brak danych do wykresu czasowego.")
 
-def render_export_section(db):
-    st.header("⬇️ Eksport CSV")
+    tab1, tab2 = st.tabs(["🏆 Najpopularniejsze Modele", "📁 Struktura Kategorii"])
 
-    table = st.selectbox(
-        "Tabela",
-        [
-            "pracownicy",
-            "modele_narzedzi",
-            "wypozyczenia",
-        ],
-    )
+    with tab1:
+        if top_models:
+            df_models = pd.DataFrame(top_models)
+            st.bar_chart(df_models.set_index("model_name"), horizontal=True, color="#FF4B4B")
+        else:
+            st.write("Brak danych.")
 
-    if st.button("Eksportuj"):
-        csv_data = crud.export_table_to_csv(db, table)
-        st.download_button(
-            "Pobierz CSV",
-            data=csv_data,
-            file_name=f"{table}.csv",
-            mime="text/csv",
-        )
+    with tab2:
+        if categories:
+            df_cat = pd.DataFrame(categories)
+            st.bar_chart(df_cat.set_index("kategoria"), color="#34495E")
 
 
-def show_clean_pydantic_error(e: ValidationError):
-    """Przetwarza techniczny błąd Pydantic na czytelny komunikat Streamlit."""
-    for error in e.errors():
-        # Pobieramy nazwę pola (np. 'pesel') i typ błędu
-        field = error['loc'][-1]
-        msg = error['msg']
+def render_export_section(api):
+    st.header("⬇️ Eksport")
+    table = st.selectbox("Tabela", ["pracownicy", "modele_narzedzi", "wypozyczenia"])
+    if st.button("Generuj i pobierz", use_container_width=True):
+        resp = api.get(f"/analytics/export/{table}")
+        if resp:
+            st.download_button("Pobierz CSV", data=resp.content, file_name=f"{table}.csv")
 
-        # Opcjonalne tłumaczenie najczęstszych błędów
-        friendly_msg = msg
-        if "at least 11 characters" in msg:
-            friendly_msg = "musi mieć dokładnie 11 cyfr."
-        elif "value is not a valid email" in msg:
-            friendly_msg = "ma niepoprawny format adresu e-mail."
 
-        st.error(f"❌ Pole **{field.capitalize()}** {friendly_msg}")
+def show_manager_ui(api, section):
+    if st.sidebar.button("🔄 Odśwież wszystkie dane"):
+        st.cache_data.clear()
+        st.rerun()
+
+    if section == "Pracownicy":
+        render_employees_section(api)
+    elif section == "Modele":
+        render_models_section(api)
+    elif section == "Analiza":
+        render_analytics_section(api)
+    elif section == "Eksport":
+        render_export_section(api)

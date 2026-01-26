@@ -1,17 +1,43 @@
 version: '3.8'
+
 services:
   db:
     image: postgres:15
-    container_name: rental_db
+    container_name: tool_rental_db
     restart: always
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: tool_rental
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: rental_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: tool_rental_api
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/rental_db
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: tool_rental_ui
+    depends_on:
+      - backend
+    environment:
+      API_URL: http://backend:8000
+    ports:
+      - "8501:8501"
 
 volumes:
   postgres_data:
